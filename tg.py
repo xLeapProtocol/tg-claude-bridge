@@ -214,6 +214,51 @@ def set_conversation_id(chat_id: str, conv_id: str | None):
     _save_chat_map()
 
 
+_USAGE_FIELDS = (
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
+)
+
+
+def _empty_usage() -> dict:
+    acc = {"runs": 0, "cost_usd": 0.0}
+    for f in _USAGE_FIELDS:
+        acc[f] = 0
+    return acc
+
+
+def add_usage(chat_id: str, cost: float, usage: dict):
+    """Accumulate token/cost stats for a chat from a Claude `result` event."""
+    if chat_id not in _chat_map:
+        _chat_map[chat_id] = {"conv_id": None, "work_dir": WORK_DIR}
+    acc = _chat_map[chat_id].setdefault("usage", _empty_usage())
+    acc["runs"] += 1
+    acc["cost_usd"] += cost or 0.0
+    acc["input_tokens"] += usage.get("input_tokens", 0)
+    acc["output_tokens"] += usage.get("output_tokens", 0)
+    acc["cache_read_tokens"] += usage.get("cache_read_input_tokens", 0)
+    acc["cache_creation_tokens"] += usage.get("cache_creation_input_tokens", 0)
+    _save_chat_map()
+
+
+def get_usage(chat_id: str) -> dict | None:
+    entry = _chat_map.get(chat_id)
+    return entry.get("usage") if entry else None
+
+
+def get_global_usage() -> dict:
+    """Sum usage across all known chats."""
+    total = _empty_usage()
+    for entry in _chat_map.values():
+        u = entry.get("usage")
+        if not u:
+            continue
+        total["runs"] += u.get("runs", 0)
+        total["cost_usd"] += u.get("cost_usd", 0.0)
+        for f in _USAGE_FIELDS:
+            total[f] += u.get(f, 0)
+    return total
+
+
 def get_work_dir(chat_id: str) -> str:
     entry = _chat_map.get(chat_id)
     return entry.get("work_dir", WORK_DIR) if entry else WORK_DIR
@@ -320,6 +365,20 @@ def _format_tool_line(name, inp):
         if len(short) > 80:
             short = short[:77] + "\u2026"
         return f"\U0001f527 *{name}* `{short}`"
+
+
+def _format_usage(u: dict, title: str) -> str:
+    total_in = u["input_tokens"] + u["cache_read_tokens"] + u["cache_creation_tokens"]
+    return (
+        f"*{title}*\n"
+        f"Runs: {u['runs']}\n"
+        f"Est. cost: ${u['cost_usd']:.4f}\n"
+        f"Input tokens: {total_in:,}\n"
+        f"  • fresh: {u['input_tokens']:,}\n"
+        f"  • cache read: {u['cache_read_tokens']:,}\n"
+        f"  • cache write: {u['cache_creation_tokens']:,}\n"
+        f"Output tokens: {u['output_tokens']:,}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +531,8 @@ def call_claude_streaming(chat_id, message, conversation_id=None,
 
             elif etype == "result":
                 conv_id = event.get("session_id", conv_id)
+                add_usage(chat_id, event.get("total_cost_usd", 0.0),
+                          event.get("usage", {}) or {})
                 if not response_text:
                     response_text = event.get("result", "")
 
@@ -570,6 +631,22 @@ class ChatWorker:
                                  f"\U0001f504 New conversation in `{target}`")
                 else:
                     send_message(self.chat_id, "\U0001f504 Conversation cleared.")
+                continue
+
+            # /usage — report accumulated token/cost stats (global + this chat)
+            if combined.strip() == "/usage":
+                g = get_global_usage()
+                parts = [_format_usage(g, "\U0001f4ca Usage — all chats (cumulative)")]
+                mine = get_usage(self.chat_id)
+                if mine:
+                    parts.append(_format_usage(mine, "\U0001f464 This chat"))
+                parts.append(
+                    "\n_Note: these are tokens **spent** (summed from Claude "
+                    "run results), not remaining quota. The 5h/weekly limits "
+                    "shown by interactive /usage are not exposed to headless "
+                    "`claude -p`._"
+                )
+                send_message(self.chat_id, "\n\n".join(parts))
                 continue
 
             # /compact
