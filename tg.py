@@ -15,6 +15,7 @@ Environment variables:
 import json
 import os
 import subprocess
+from datetime import datetime
 import sys
 import tempfile
 import threading
@@ -382,6 +383,73 @@ def _format_usage(u: dict, title: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Remaining subscription quota (5h / weekly windows)
+#
+# Undocumented: the interactive `/usage` command sources its data from this
+# OAuth endpoint, which `claude -p` does NOT expose. We reuse the OAuth token
+# Claude Code stores locally. This is best-effort and may break on any Claude
+# Code / API change.
+# ---------------------------------------------------------------------------
+
+CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
+OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def _fmt_reset(iso: str) -> str:
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%a %H:%M")
+    except (ValueError, TypeError):
+        return iso
+
+
+def _fmt_window(label: str, w: dict | None) -> str | None:
+    if not w or w.get("utilization") is None:
+        return None
+    used = w["utilization"]
+    left = max(0.0, 100.0 - used)
+    line = f"{label}: *{left:.0f}%* left ({used:.0f}% used)"
+    if w.get("resets_at"):
+        line += f", resets {_fmt_reset(w['resets_at'])}"
+    return line
+
+
+def fetch_remaining_quota() -> tuple[str | None, str | None]:
+    """Best-effort fetch of subscription limit windows. Returns (text, error)."""
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            token = json.load(f)["claudeAiOauth"]["accessToken"]
+    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError) as e:
+        return None, f"no OAuth credentials ({e})"
+
+    req = urllib.request.Request(OAUTH_USAGE_URL, headers={
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return None, "token expired — run any claude command to refresh"
+        return None, f"HTTP {e.code}"
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        return None, f"request failed: {e}"
+
+    windows = (
+        ("5h", "five_hour"),
+        ("7d", "seven_day"),
+        ("7d Opus", "seven_day_opus"),
+        ("7d Sonnet", "seven_day_sonnet"),
+    )
+    lines = [ln for label, key in windows
+             if (ln := _fmt_window(label, data.get(key)))]
+    if not lines:
+        return None, "no window data in response"
+    return "\n".join(lines), None
+
+
+# ---------------------------------------------------------------------------
 # Claude CLI streaming call
 # ---------------------------------------------------------------------------
 
@@ -633,19 +701,18 @@ class ChatWorker:
                     send_message(self.chat_id, "\U0001f504 Conversation cleared.")
                 continue
 
-            # /usage — report accumulated token/cost stats (global + this chat)
+            # /usage — remaining subscription quota + cumulative spend
             if combined.strip() == "/usage":
+                quota, qerr = fetch_remaining_quota()
+                if quota:
+                    parts = ["\U0001f6e0 *Remaining (subscription limits)*\n" + quota]
+                else:
+                    parts = [f"\U0001f6e0 *Remaining:* unavailable — {qerr}"]
                 g = get_global_usage()
-                parts = [_format_usage(g, "\U0001f4ca Usage — all chats (cumulative)")]
+                parts.append(_format_usage(g, "\U0001f4ca Spent — all chats (cumulative)"))
                 mine = get_usage(self.chat_id)
                 if mine:
-                    parts.append(_format_usage(mine, "\U0001f464 This chat"))
-                parts.append(
-                    "\n_Note: these are tokens **spent** (summed from Claude "
-                    "run results), not remaining quota. The 5h/weekly limits "
-                    "shown by interactive /usage are not exposed to headless "
-                    "`claude -p`._"
-                )
+                    parts.append(_format_usage(mine, "\U0001f464 Spent — this chat"))
                 send_message(self.chat_id, "\n\n".join(parts))
                 continue
 
