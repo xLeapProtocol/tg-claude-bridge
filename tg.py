@@ -38,6 +38,30 @@ WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 BATCH_WAIT = 3  # seconds to wait for more messages after first one
 THINKING_UPDATE_INTERVAL = 2
 
+# Helper the spawned agent uses to push files / notifications to Telegram.
+SEND_SCRIPT = os.path.join(WORK_DIR, "tg_send.py")
+
+# Hardcoded operating rules injected into every `claude -p` run so the agent
+# always knows it is talking to a human over Telegram, not a terminal.
+BRIDGE_RULES = f"""You are Claude Code running inside a Telegram bridge. The human is chatting \
+with you from a Telegram thread, NOT a local terminal. Follow these rules:
+
+1. DELIVER FILES, DON'T PRINT PATHS. Whenever the user asks for a file, log, \
+screenshot, build artifact, or any file content they'd want to open, actually \
+send it to them by running:
+       python3 {SEND_SCRIPT} --file <absolute_path> ["short caption"]
+   Use `--photo <absolute_path>` instead for images so they render inline.
+
+2. NOTIFICATIONS GO TO THE THREAD. Whenever the user asks you to notify, alert, \
+ping, or message them (for example "tell me when the build finishes"), send the \
+notification by running:
+       python3 {SEND_SCRIPT} "your message"
+   This delivers to the chat/thread configured in the TG_CHAT_ID / TG_THREAD_ID \
+   environment variables. Do not claim you have notified them unless you ran it.
+
+3. Your normal text answer is already shown in Telegram automatically — only use \
+the tg_send.py helper for files or for explicit out-of-band notifications."""
+
 
 # ---------------------------------------------------------------------------
 # Logging — output to stdout AND registered Telegram chats
@@ -273,6 +297,18 @@ def set_work_dir(chat_id: str, work_dir: str):
     _save_chat_map()
 
 
+def get_tmux_target(chat_id: str) -> str | None:
+    entry = _chat_map.get(chat_id)
+    return entry.get("tmux_target") if entry else None
+
+
+def set_tmux_target(chat_id: str, target: str | None):
+    if chat_id not in _chat_map:
+        _chat_map[chat_id] = {"conv_id": None, "work_dir": WORK_DIR}
+    _chat_map[chat_id]["tmux_target"] = target
+    _save_chat_map()
+
+
 # ---------------------------------------------------------------------------
 # Per-chat message sending
 # ---------------------------------------------------------------------------
@@ -450,6 +486,97 @@ def fetch_remaining_quota() -> tuple[str | None, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# tmux bridge — attach a chat to a live Claude Code pane running in tmux
+# ---------------------------------------------------------------------------
+
+# How long the captured pane must stay unchanged before we consider the
+# Claude pane "done" responding (seconds = TMUX_IDLE_ROUNDS * TMUX_POLL).
+TMUX_POLL = 2
+TMUX_IDLE_ROUNDS = 3
+TMUX_MAX_WAIT = 900
+
+
+def _tmux(*args) -> subprocess.CompletedProcess:
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def list_claude_panes() -> list[dict]:
+    """Return panes whose foreground command looks like Claude Code."""
+    fmt = ("#{session_name}\t#{window_index}.#{pane_index}\t"
+           "#{pane_current_command}\t#{pane_title}\t#{pane_current_path}")
+    r = _tmux("list-panes", "-a", "-F", fmt)
+    panes = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        sess, pane, cmd, title, path = parts[:5]
+        if "claude" not in cmd.lower():
+            continue
+        panes.append({
+            "session": sess, "pane": pane, "cmd": cmd,
+            "title": title, "path": path, "target": f"{sess}:{pane}",
+        })
+    return panes
+
+
+def tmux_target_exists(target: str) -> bool:
+    return _tmux("capture-pane", "-t", target, "-p").returncode == 0
+
+
+def tmux_capture(target: str) -> str:
+    return _tmux("capture-pane", "-t", target, "-p").stdout
+
+
+def tmux_send(target: str, message: str):
+    """Type a message into the pane and submit it."""
+    _tmux("send-keys", "-t", target, "-l", message)
+    time.sleep(0.3)
+    _tmux("send-keys", "-t", target, "Enter")
+
+
+def _strip_pane(text: str) -> str:
+    return "\n".join(text.rstrip().splitlines()).rstrip()
+
+
+def tmux_relay(target, message, key, thinking_msg_id, stop_event):
+    """Send `message` to the tmux pane, wait for the pane to settle, return
+    the final visible pane contents."""
+    tmux_send(target, message)
+
+    last = tmux_capture(target)
+    idle = 0
+    deadline = time.time() + TMUX_MAX_WAIT
+    last_edit = 0.0
+
+    while time.time() < deadline:
+        if stop_event.is_set():
+            _tmux("send-keys", "-t", target, "Escape")
+            break
+        time.sleep(TMUX_POLL)
+        cur = tmux_capture(target)
+        if cur == last:
+            idle += 1
+        else:
+            idle = 0
+            last = cur
+            now = time.time()
+            if thinking_msg_id and now - last_edit >= THINKING_UPDATE_INTERVAL:
+                tail = _strip_pane(cur)[-1500:]
+                edit_message(key, thinking_msg_id,
+                             f"⏳ *In tmux pane* `{target}`\n```\n{tail}\n```",
+                             with_stop_button=True)
+                last_edit = now
+        if idle >= TMUX_IDLE_ROUNDS:
+            break
+
+    out = _strip_pane(last)
+    if stop_event.is_set():
+        out += "\n\n\U0001f6d1 *Stopped (sent Escape to pane).*"
+    return out or "[no output captured from pane]"
+
+
+# ---------------------------------------------------------------------------
 # Claude CLI streaming call
 # ---------------------------------------------------------------------------
 
@@ -460,7 +587,8 @@ def call_claude_streaming(chat_id, message, conversation_id=None,
     env = os.environ.copy()
     env["IS_SANDBOX"] = "1"
     cmd = ["claude", "-p", "--verbose", "--dangerously-skip-permissions",
-           "--output-format", "stream-json", "--effort", "medium"]
+           "--output-format", "stream-json", "--effort", "medium",
+           "--append-system-prompt", BRIDGE_RULES]
     if conversation_id:
         cmd.extend(["--resume", conversation_id])
     cmd.append(message)
@@ -652,6 +780,7 @@ class ChatWorker:
         """Main loop for this chat's worker thread."""
         conversation_id = get_conversation_id(self.chat_id)
         self.work_dir = get_work_dir(self.chat_id)
+        self.tmux_target = get_tmux_target(self.chat_id)
         if conversation_id:
             log(f"  [{self.chat_id}] resumed conv {conversation_id} in {self.work_dir}", self.chat_id)
 
@@ -701,6 +830,72 @@ class ChatWorker:
                     send_message(self.chat_id, "\U0001f504 Conversation cleared.")
                 continue
 
+            # /list — show tmux panes running Claude Code
+            if combined.strip() == "/list":
+                panes = list_claude_panes()
+                if not panes:
+                    send_message(self.chat_id,
+                                 "No tmux panes running Claude Code found.")
+                    continue
+                lines = ["\U0001f5a5 *Claude Code panes in tmux:*", ""]
+                for p in panes:
+                    title = p["title"] or p["path"]
+                    lines.append(f"• `{p['session']}` `{p['pane']}` — {title}")
+                lines.append("")
+                lines.append("Connect with: `/connect <session> <pane>`")
+                if self.tmux_target:
+                    lines.append(f"\nCurrently connected to `{self.tmux_target}` "
+                                 f"(use /disconnect to detach).")
+                send_message(self.chat_id, "\n".join(lines))
+                continue
+
+            # /connect <session> <pane> — bridge this thread to a tmux pane
+            if combined.strip() == "/connect" or combined.strip().startswith("/connect "):
+                args = combined.strip()[len("/connect"):].split()
+                if len(args) < 1:
+                    send_message(self.chat_id,
+                                 "Usage: `/connect <session> <pane>`  (see /list)")
+                    continue
+                if len(args) == 1:
+                    # Allow `/connect session:1.0` or single-pane session lookup
+                    if ":" in args[0]:
+                        target = args[0]
+                    else:
+                        matches = [p for p in list_claude_panes()
+                                   if p["session"] == args[0]]
+                        if not matches:
+                            send_message(self.chat_id,
+                                         f"❌ No Claude pane in session `{args[0]}` "
+                                         f"(see /list).")
+                            continue
+                        target = matches[0]["target"]
+                else:
+                    target = f"{args[0]}:{args[1]}"
+                if not tmux_target_exists(target):
+                    send_message(self.chat_id,
+                                 f"❌ tmux target `{target}` not found (see /list).")
+                    continue
+                self.tmux_target = target
+                set_tmux_target(self.chat_id, target)
+                send_message(self.chat_id,
+                             f"\U0001f50c Connected to tmux pane `{target}`.\n"
+                             f"Messages now go straight to that Claude session. "
+                             f"Use /disconnect to return to the normal bridge.")
+                continue
+
+            # /disconnect — detach from the tmux pane
+            if combined.strip() == "/disconnect":
+                if not self.tmux_target:
+                    send_message(self.chat_id, "Not connected to any tmux pane.")
+                    continue
+                old = self.tmux_target
+                self.tmux_target = None
+                set_tmux_target(self.chat_id, None)
+                send_message(self.chat_id,
+                             f"\U0001f50c Disconnected from `{old}`. "
+                             f"Back to the normal bridge.")
+                continue
+
             # /usage — remaining subscription quota + cumulative spend
             if combined.strip() == "/usage":
                 quota, qerr = fetch_remaining_quota()
@@ -738,6 +933,25 @@ class ChatWorker:
 
             # Reset stop flag before each call
             self.stop_event.clear()
+
+            # tmux bridge mode — forward to a live Claude Code pane
+            if self.tmux_target:
+                if not tmux_target_exists(self.tmux_target):
+                    send_message(self.chat_id,
+                                 f"❌ tmux pane `{self.tmux_target}` is gone. "
+                                 f"Use /list and /connect again, or /disconnect.")
+                    self.tmux_target = None
+                    set_tmux_target(self.chat_id, None)
+                    continue
+                thinking_msg_id = send_message_with_id(
+                    self.chat_id, f"⏳ *Sending to tmux* `{self.tmux_target}`…",
+                    with_stop_button=True)
+                out = tmux_relay(self.tmux_target, combined, self.chat_id,
+                                 thinking_msg_id, self.stop_event)
+                edit_message(self.chat_id, thinking_msg_id,
+                             f"✅ *tmux* `{self.tmux_target}`")
+                send_message(self.chat_id, out)
+                continue
 
             thinking_msg_id = send_message_with_id(
                 self.chat_id, "\U0001f4ad *Thinking...*", with_stop_button=True)

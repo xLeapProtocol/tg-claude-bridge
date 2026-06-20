@@ -1,0 +1,15 @@
+# Secrets and local state
+.tg-bridge.env
+.tg_chat_map.json
+.tg_last_update
+.tg_downloads/
+.tg_inspect/
+.xdraft.log
+.xdraft_offset
+.xdraft_sessions.json
+.restart.log
+
+# Caches / IDE
+__pycache__/
+.venv-stt/
+.idea/
