@@ -31,6 +31,11 @@ ALLOWED_CHATS = {
     for cid in os.environ.get("TG_ALLOWED_CHATS", "").split(",")
     if cid.strip()
 }
+# When set, the bot ignores any message that does not start with this tag
+# (case-insensitive). The tag is stripped before the message is processed.
+# Useful for shared chats where you want the bot to stay quiet by default.
+# Example: TG_MENTION_TAG="@claude" → only "@claude do X" triggers a reply.
+MENTION_TAG = os.environ.get("TG_MENTION_TAG", "").strip()
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tg_last_update")
 CHAT_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tg_chat_map.json")
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1132,6 +1137,16 @@ def poll_loop():
 
             if not chat_id or (not text and not file_id):
                 continue
+
+            # Mention-tag gate: when MENTION_TAG is set, the bot ignores any
+            # message whose text/caption does not start with that tag
+            # (case-insensitive). The tag is stripped before processing.
+            if MENTION_TAG:
+                stripped = text.lstrip()
+                if not stripped.lower().startswith(MENTION_TAG.lower()):
+                    log(f"  [update {uid}] missing mention tag, ignored")
+                    continue
+                text = stripped[len(MENTION_TAG):].lstrip()
 
             # Download file and build message
             if file_id:
