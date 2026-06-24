@@ -7,7 +7,9 @@ cd /home/$USER/tg-claude-bridge || exit 1
 sleep 3
 tmux kill-session -t tg-bridge 2>/dev/null
 sleep 1
-tmux new -d -s tg-bridge 'set -a; . ./.tg-bridge.env; set +a; exec python3 tg.py'
+# Ensure ~/.local/bin (typical Claude CLI install location) is on PATH so the
+# bot's subprocess can find `claude` regardless of how the shell was launched.
+tmux new -d -s tg-bridge 'export PATH="$HOME/.local/bin:$PATH"; set -a; . ./.tg-bridge.env; set +a; exec python3 tg.py'
 sleep 2
 
 # Load env and notify the configured thread that the restart is done.
