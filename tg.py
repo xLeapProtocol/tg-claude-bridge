@@ -15,6 +15,7 @@ Environment variables:
 import json
 import os
 import subprocess
+from collections import deque
 from datetime import datetime
 import sys
 import tempfile
@@ -36,6 +37,10 @@ ALLOWED_CHATS = {
 # Useful for shared chats where you want the bot to stay quiet by default.
 # Example: TG_MENTION_TAG="@claude" → only "@claude do X" triggers a reply.
 MENTION_TAG = os.environ.get("TG_MENTION_TAG", "").strip()
+# How much rolling chat history (per chat:thread) the bot keeps so it can
+# include preceding context when a mention-tagged message arrives. Only used
+# when MENTION_TAG is set — without it the bot already sees every message.
+HISTORY_LIMIT = int(os.environ.get("TG_HISTORY_LIMIT", "10"))
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tg_last_update")
 CHAT_MAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tg_chat_map.json")
 WORK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +97,60 @@ def _parse_key(key):
         cid, tid = key.split(":", 1)
         return cid, int(tid)
     return key, None
+
+
+# ---------------------------------------------------------------------------
+# Rolling chat history (per chat:thread) — used when MENTION_TAG is set so
+# the bot can include surrounding messages as context for the tagged reply.
+# ---------------------------------------------------------------------------
+
+_history: dict[str, deque] = {}
+_history_lock = threading.Lock()
+
+
+def _sender_label(msg: dict) -> str:
+    """Best-effort human-readable sender label for a Telegram message."""
+    frm = msg.get("from") or {}
+    name = " ".join(filter(None, [frm.get("first_name"), frm.get("last_name")]))
+    if name:
+        return name
+    if frm.get("username"):
+        return "@" + frm["username"]
+    return "?"
+
+
+def push_history(key: str, msg: dict, raw_text: str):
+    """Append a message to the per-chat rolling buffer."""
+    if HISTORY_LIMIT <= 0 or not raw_text:
+        return
+    item = {
+        "ts": int(msg.get("date") or time.time()),
+        "sender": _sender_label(msg),
+        "text": raw_text,
+    }
+    with _history_lock:
+        buf = _history.setdefault(key, deque(maxlen=HISTORY_LIMIT))
+        buf.append(item)
+
+
+def format_history_block(key: str, exclude_last: bool = True) -> str:
+    """Render the buffer as a context block. The current (just-pushed)
+    message is the last item; pass exclude_last=True to drop it from the
+    rendered context so the trigger message isn't shown twice."""
+    with _history_lock:
+        items = list(_history.get(key, ()))
+    if exclude_last and items:
+        items = items[:-1]
+    if not items:
+        return ""
+    lines = [f"[Recent chat context — last {len(items)} message(s), oldest first]"]
+    for it in items:
+        when = datetime.fromtimestamp(it["ts"]).strftime("%Y-%m-%d %H:%M:%S")
+        # One-line per message; collapse internal newlines to keep it compact.
+        body = it["text"].replace("\n", " ")
+        lines.append(f"{when}  {it['sender']}: {body}")
+    lines.append("[End context]")
+    return "\n".join(lines)
 
 
 def log(msg, key=None):
@@ -1138,15 +1197,25 @@ def poll_loop():
             if not chat_id or (not text and not file_id):
                 continue
 
+            # Compute key early so we can record the message into the rolling
+            # history buffer even when the mention-tag gate ends up ignoring it.
+            thread_id_for_history = msg.get("message_thread_id")
+            hist_key = (f"{chat_id}:{thread_id_for_history}"
+                        if thread_id_for_history else chat_id)
+            push_history(hist_key, msg, text)
+
             # Mention-tag gate: when MENTION_TAG is set, the bot ignores any
             # message whose text/caption does not start with that tag
-            # (case-insensitive). The tag is stripped before processing.
+            # (case-insensitive). The tag is stripped before processing and
+            # the prior chat history is prepended as context for the agent.
+            history_prefix = ""
             if MENTION_TAG:
                 stripped = text.lstrip()
                 if not stripped.lower().startswith(MENTION_TAG.lower()):
                     log(f"  [update {uid}] missing mention tag, ignored")
                     continue
                 text = stripped[len(MENTION_TAG):].lstrip()
+                history_prefix = format_history_block(hist_key, exclude_last=True)
 
             # Download file and build message
             if file_id:
@@ -1180,6 +1249,10 @@ def poll_loop():
                 continue
 
             log(f"  [update {uid}] {key} text={text[:40]!r}", key)
+
+            # Prepend rolling chat context for mention-tagged requests.
+            if history_prefix:
+                text = f"{history_prefix}\n\n[New tagged request follows]\n{text}"
 
             worker = get_worker(key)
 
