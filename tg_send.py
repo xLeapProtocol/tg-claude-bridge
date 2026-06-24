@@ -48,6 +48,25 @@ def send_text(text: str) -> dict:
         return json.loads(resp.read())
 
 
+def send_rich(markdown: str) -> dict:
+    """Send via Bot API 10.1 sendRichMessage (CommonMark). Falls back to
+    plain sendMessage if the server rejects it (400)."""
+    payload = _base_params()
+    payload["rich_message"] = {"markdown": markdown}
+    req = urllib.request.Request(
+        _api_url("sendRichMessage"),
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"tg_send: sendRichMessage failed ({e.code}), falling back: "
+              f"{e.read().decode()[:200]}", file=sys.stderr)
+        return send_text(markdown)
+
+
 def _multipart(fields: dict, file_field: str, path: str) -> tuple[bytes, str]:
     """Build a multipart/form-data body."""
     boundary = uuid.uuid4().hex
@@ -107,6 +126,19 @@ def main(argv: list[str]) -> int:
             caption = " ".join(argv[2:])
             send_file(path, caption, as_photo=as_photo)
             print(f"tg_send: delivered {path}")
+        elif argv[0] == "--rich":
+            if len(argv) < 2:
+                print("tg_send: missing markdown body", file=sys.stderr)
+                return 1
+            send_rich(" ".join(argv[1:]))
+            print("tg_send: rich notification delivered")
+        elif argv[0] == "--rich-file":
+            if len(argv) < 2:
+                print("tg_send: missing markdown file path", file=sys.stderr)
+                return 1
+            with open(os.path.expanduser(argv[1])) as f:
+                send_rich(f.read())
+            print(f"tg_send: rich notification delivered from {argv[1]}")
         else:
             send_text(" ".join(argv))
             print("tg_send: notification delivered")

@@ -60,7 +60,21 @@ notification by running:
    environment variables. Do not claim you have notified them unless you ran it.
 
 3. Your normal text answer is already shown in Telegram automatically — only use \
-the tg_send.py helper for files or for explicit out-of-band notifications."""
+the tg_send.py helper for files or for explicit out-of-band notifications.
+
+4. STYLE YOUR REPLIES WITH RICH MARKDOWN. The bridge sends your replies via \
+Telegram's new sendRichMessage endpoint (Bot API 10.1, June 2026), which accepts \
+full CommonMark. Use the formatting freely whenever it makes the answer clearer:
+   - `#`, `##`, `###` headings for sections
+   - GFM **tables** with `|` and `---` (pipe-tables render natively now)
+   - Fenced code blocks with language tag (```python, ```rust, ```sql, ```bash)
+   - `$inline$` and `$$display$$` LaTeX for math
+   - `> blockquotes`, `- bullets`, `1.` numbered lists, `- [ ]` task lists
+   - `**bold**`, `*italic*`, `~~strikethrough~~`, `||spoilers||`, `` `code` ``
+   - `---` horizontal rules between sections
+   Pick formatting that fits — a one-line answer stays one line, but a comparison \
+   wants a table, a multi-step explanation wants headings or a numbered list, and \
+   any code longer than ~3 tokens belongs in a fenced block with its language."""
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +120,26 @@ def api_json(method, payload):
 # ---------------------------------------------------------------------------
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tg_downloads")
+VENV_PY = os.path.join(WORK_DIR, ".venv", "bin", "python")
+TRANSCRIBE_SCRIPT = os.path.join(WORK_DIR, "transcribe.py")
+AUDIO_EXTS = {".oga", ".ogg", ".opus", ".mp3", ".m4a", ".wav", ".flac", ".webm"}
+
+
+def transcribe_audio(path: str) -> str | None:
+    """Run transcribe.py on an audio file. Returns transcript text or None."""
+    if not os.path.isfile(VENV_PY) or not os.path.isfile(TRANSCRIBE_SCRIPT):
+        return None
+    try:
+        r = subprocess.run([VENV_PY, TRANSCRIBE_SCRIPT, path],
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            log(f"[transcribe error: {r.stderr.strip()}]")
+            return None
+        out = r.stdout.strip()
+        return out or None
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"[transcribe error: {e}]")
+        return None
 
 
 def download_tg_file(file_id: str, filename: str | None = None) -> str | None:
@@ -313,44 +347,90 @@ def set_tmux_target(chat_id: str, target: str | None):
 # Per-chat message sending
 # ---------------------------------------------------------------------------
 
-def send_message(key, text):
-    chat_id, thread_id = _parse_key(key)
-    chunks = [text[i:i + 4096] for i in range(0, len(text), 4096)]
-    for chunk in chunks:
-        params = {"chat_id": chat_id, "text": chunk}
-        if thread_id:
-            params["message_thread_id"] = thread_id
-        try:
-            api("sendMessage", parse_mode="Markdown", **params)
-        except urllib.error.HTTPError:
-            api("sendMessage", **params)
-
-
 def _stop_keyboard():
     return {"inline_keyboard": [[{"text": "\U0001f6d1 Stop", "callback_data": "force_stop"}]]}
 
 
-def send_message_with_id(key, text, with_stop_button=False):
-    chat_id, thread_id = _parse_key(key)
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+# sendRichMessage (Bot API 10.1) accepts much longer payloads than legacy
+# sendMessage's 4096-char cap. We chunk a bit conservatively for safety.
+RICH_CHUNK = 8000
+LEGACY_CHUNK = 4096
+
+
+def _send_rich(chat_id, thread_id, text, with_stop_button=False):
+    """Try sendRichMessage; on failure, fall back to legacy Markdown chunked send.
+    Returns the message_id of the (last) sent message, or None."""
+    payload = {"chat_id": chat_id, "rich_message": {"markdown": text}}
     if thread_id:
         payload["message_thread_id"] = thread_id
     if with_stop_button:
         payload["reply_markup"] = _stop_keyboard()
     try:
-        resp = api_json("sendMessage", payload)
-    except urllib.error.HTTPError:
-        payload.pop("parse_mode", None)
-        resp = api_json("sendMessage", payload)
-    return resp.get("result", {}).get("message_id")
+        resp = api_json("sendRichMessage", payload)
+        return resp.get("result", {}).get("message_id")
+    except urllib.error.HTTPError as e:
+        log(f"[sendRichMessage failed ({e.code}), falling back to legacy Markdown]")
+        return _send_legacy(chat_id, thread_id, text, with_stop_button)
+
+
+def _send_legacy(chat_id, thread_id, text, with_stop_button=False):
+    """Fallback: classic sendMessage with Markdown parse_mode, chunked at 4096."""
+    chunks = [text[i:i + LEGACY_CHUNK] for i in range(0, len(text), LEGACY_CHUNK)] or [""]
+    last_id = None
+    for idx, chunk in enumerate(chunks):
+        payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"}
+        if thread_id:
+            payload["message_thread_id"] = thread_id
+        # Only attach the stop button to the LAST chunk
+        if with_stop_button and idx == len(chunks) - 1:
+            payload["reply_markup"] = _stop_keyboard()
+        try:
+            resp = api_json("sendMessage", payload)
+        except urllib.error.HTTPError:
+            payload.pop("parse_mode", None)
+            try:
+                resp = api_json("sendMessage", payload)
+            except urllib.error.HTTPError:
+                resp = {}
+        last_id = resp.get("result", {}).get("message_id") or last_id
+    return last_id
+
+
+def send_message(key, text):
+    """Send a final reply. Chunks if needed."""
+    chat_id, thread_id = _parse_key(key)
+    if len(text) <= RICH_CHUNK:
+        _send_rich(chat_id, thread_id, text)
+        return
+    for i in range(0, len(text), RICH_CHUNK):
+        _send_rich(chat_id, thread_id, text[i:i + RICH_CHUNK])
+
+
+def send_message_with_id(key, text, with_stop_button=False):
+    """Send a message and return its id (for later edit_message updates)."""
+    chat_id, thread_id = _parse_key(key)
+    return _send_rich(chat_id, thread_id, text[:RICH_CHUNK], with_stop_button)
 
 
 def edit_message(key, message_id, text, with_stop_button=False):
     if not message_id:
         return
     chat_id, _ = _parse_key(key)
-    text = text[:4096]
-    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    text = text[:RICH_CHUNK]
+    payload = {"chat_id": chat_id, "message_id": message_id,
+               "rich_message": {"markdown": text}}
+    if with_stop_button:
+        payload["reply_markup"] = _stop_keyboard()
+    else:
+        payload["reply_markup"] = {"inline_keyboard": []}
+    try:
+        api_json("editMessageText", payload)
+        return
+    except urllib.error.HTTPError:
+        pass
+    # Fallback to legacy edit
+    payload = {"chat_id": chat_id, "message_id": message_id,
+               "text": text[:LEGACY_CHUNK], "parse_mode": "Markdown"}
     if with_stop_button:
         payload["reply_markup"] = _stop_keyboard()
     else:
@@ -1055,6 +1135,13 @@ def poll_loop():
                     file_note = f"[File uploaded: {local_path}]"
                     if file_name:
                         file_note = f"[File uploaded: {file_name} -> {local_path}]"
+                    # Auto-transcribe voice notes / audio
+                    ext = os.path.splitext(local_path)[1].lower()
+                    is_voice = bool(msg.get("voice"))
+                    if is_voice or ext in AUDIO_EXTS:
+                        transcript = transcribe_audio(local_path)
+                        if transcript:
+                            file_note = f"[Voice transcript: {transcript}]\n{file_note}"
                     text = f"{file_note}\n{text}" if text else file_note
                 else:
                     text = f"[File upload failed to download]\n{text}" if text else "[File upload failed to download]"
