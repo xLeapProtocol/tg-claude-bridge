@@ -105,7 +105,18 @@ that contains the surrounding conversation, each line formatted as \
    - Stay focused on the latest tagged request; earlier context is background, \
      not a todo list. Don't reply to messages that weren't tagged.
    - Address people by the names that appear in the context when it helps \
-     clarity ("Alice, you mentioned X — here's what I'd do…")."""
+     clarity ("Alice, you mentioned X — here's what I'd do…").
+   - VOICE NOTES & IMAGES IN CONTEXT. The chat-history block records every \
+     message including non-text ones:
+       • a voice note appears as `[Voice transcript: …]\\n[File uploaded: \
+         /abs/path.oga]` — treat the transcript text as if the user typed it.
+       • an image appears as `[Image attached: /abs/path.jpg]` and a \
+         document as `[File uploaded: name -> /abs/path]`.
+     When the latest tagged request refers to one of these ("translate that \
+     image", "what does the chart say", "summarize the voice note"), use \
+     your `Read` tool on the absolute path you see in the context to actually \
+     view the file — your `Read` tool can open images and most binaries \
+     directly. Never claim you can't see it without trying `Read` first."""
 
 
 # ---------------------------------------------------------------------------
@@ -1218,6 +1229,30 @@ def poll_loop():
             if not chat_id or (not text and not file_id):
                 continue
 
+            # Download + transcribe BEFORE pushing to history so voice notes
+            # and image/file paths end up in the rolling context buffer too —
+            # otherwise the agent would never see them when summoned later.
+            if file_id:
+                local_path = download_tg_file(file_id, file_name)
+                if local_path:
+                    ext = os.path.splitext(local_path)[1].lower()
+                    is_voice = bool(msg.get("voice"))
+                    is_image = bool(msg.get("photo")) or ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+                    if is_image:
+                        file_note = f"[Image attached: {local_path}]"
+                    elif file_name:
+                        file_note = f"[File uploaded: {file_name} -> {local_path}]"
+                    else:
+                        file_note = f"[File uploaded: {local_path}]"
+                    if is_voice or ext in AUDIO_EXTS:
+                        transcript = transcribe_audio(local_path)
+                        if transcript:
+                            file_note = f"[Voice transcript: {transcript}]\n{file_note}"
+                    text = f"{file_note}\n{text}" if text else file_note
+                else:
+                    text = (f"[File upload failed to download]\n{text}"
+                            if text else "[File upload failed to download]")
+
             # Compute key early so we can record the message into the rolling
             # history buffer even when the mention-tag gate ends up ignoring it.
             thread_id_for_history = msg.get("message_thread_id")
@@ -1237,24 +1272,6 @@ def poll_loop():
                     continue
                 text = stripped[len(MENTION_TAG):].lstrip()
                 history_prefix = format_history_block(hist_key, exclude_last=True)
-
-            # Download file and build message
-            if file_id:
-                local_path = download_tg_file(file_id, file_name)
-                if local_path:
-                    file_note = f"[File uploaded: {local_path}]"
-                    if file_name:
-                        file_note = f"[File uploaded: {file_name} -> {local_path}]"
-                    # Auto-transcribe voice notes / audio
-                    ext = os.path.splitext(local_path)[1].lower()
-                    is_voice = bool(msg.get("voice"))
-                    if is_voice or ext in AUDIO_EXTS:
-                        transcript = transcribe_audio(local_path)
-                        if transcript:
-                            file_note = f"[Voice transcript: {transcript}]\n{file_note}"
-                    text = f"{file_note}\n{text}" if text else file_note
-                else:
-                    text = f"[File upload failed to download]\n{text}" if text else "[File upload failed to download]"
 
             # Ignore messages from the "General" topic (no thread ID)
             thread_id = msg.get("message_thread_id")
