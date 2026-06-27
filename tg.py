@@ -72,16 +72,24 @@ notification by running:
 3. Your normal text answer is already shown in Telegram automatically — only use \
 the tg_send.py helper for files or for explicit out-of-band notifications.
 
-4. STYLE YOUR REPLIES WITH RICH MARKDOWN. The bridge sends your replies via \
-Telegram's new sendRichMessage endpoint (Bot API 10.1, June 2026), which accepts \
-full CommonMark. Use the formatting freely whenever it makes the answer clearer:
-   - `#`, `##`, `###` headings for sections
-   - GFM **tables** with `|` and `---` (pipe-tables render natively now)
-   - Fenced code blocks with language tag (```python, ```rust, ```sql, ```bash)
-   - `$inline$` and `$$display$$` LaTeX for math
-   - `> blockquotes`, `- bullets`, `1.` numbered lists, `- [ ]` task lists
-   - `**bold**`, `*italic*`, `~~strikethrough~~`, `||spoilers||`, `` `code` ``
-   - `---` horizontal rules between sections
+4. STYLE YOUR REPLIES WITH MARKDOWN. The bridge converts your CommonMark to \
+Telegram MarkdownV2 before sending — every reply is rendered by the official \
+Telegram clients, so use only formatting that exists in MarkdownV2 or has a \
+known fallback in the converter:
+   - `**bold**`, `*italic*`, `~~strikethrough~~`, `||spoilers||`, `` `inline code` ``
+   - Fenced code blocks with language tag (```python, ```rust, ```sql, ```bash) — \
+     render natively as syntax-highlighted blocks
+   - `# H1` / `## H2` / `### H3` headings — rendered as bold lines, fine to use
+   - `> blockquotes`, `- bullets`, `1.` numbered lists, `- [ ]` / `- [x]` task lists \
+     (rendered as ⬜ / ✅)
+   - `[link text](https://example.com)` — clickable
+   - Pipe **tables** (`| a | b |\\n|---|---|\\n| 1 | 2 |`) — rendered inside a \
+     monospace pre-block with box-drawing characters. Looks great on desktop and \
+     Telegram-web. Keep tables ≤ ~50 chars wide so they don't horizontally overflow \
+     on phones.
+   - LaTeX `$inline$` / `$$display$$` — rendered as monospace code (no real math \
+     typesetting). Still readable; use sparingly.
+   - `---` horizontal rule — rendered as a divider line.
    Pick formatting that fits — a one-line answer stays one line, but a comparison \
    wants a table, a multi-step explanation wants headings or a numbered list, and \
    any code longer than ~3 tokens belongs in a fenced block with its language."""
@@ -447,74 +455,250 @@ def _stop_keyboard():
     return {"inline_keyboard": [[{"text": "\U0001f6d1 Stop", "callback_data": "force_stop"}]]}
 
 
-# sendRichMessage (Bot API 10.1) accepts much longer payloads than legacy
-# sendMessage's 4096-char cap. We chunk a bit conservatively for safety.
-RICH_CHUNK = 8000
-LEGACY_CHUNK = 4096
+# Bot API 10.1's sendRichMessage produces a Message with a brand-new
+# `rich_message` field; clients that haven't shipped 10.1 rendering yet
+# (all of them, as of mid-2026) display "Message unsupported, please update
+# Telegram". So we send through plain sendMessage with parse_mode=MarkdownV2,
+# converting the CommonMark we produce into MarkdownV2-safe text.
+TG_MAX_LEN = 4000  # sendMessage limit is 4096; leave headroom for escapes
+import re as _re
+
+# Chars that need escaping in plain MarkdownV2 text (outside formatting / code).
+_MDV2_SPECIAL = set("_*[]()~`>#+-=|{}.!\\")
 
 
-def _send_rich(chat_id, thread_id, text, with_stop_button=False):
-    """Try sendRichMessage; on failure, fall back to legacy Markdown chunked send.
-    Returns the message_id of the (last) sent message, or None."""
-    payload = {"chat_id": chat_id, "rich_message": {"markdown": text}}
+def _esc_mdv2(s: str) -> str:
+    return "".join(("\\" + c) if c in _MDV2_SPECIAL else c for c in s)
+
+
+def _esc_mdv2_url(s: str) -> str:
+    # Per MarkdownV2 spec: inside `(...)` of a link only `)` and `\` need escaping.
+    return s.replace("\\", "\\\\").replace(")", "\\)")
+
+
+# Order matters — bold (**) must beat italic (*).
+_INLINE_RE = _re.compile(
+    r"(?P<code>`[^`\n]+`)"
+    r"|(?P<math>\$[^$\n]+\$)"
+    r"|(?P<bold>\*\*[^*\n]+\*\*)"
+    r"|(?P<italic>(?<!\*)\*[^*\n]+\*(?!\*))"
+    r"|(?P<strike>~~[^~\n]+~~)"
+    r"|(?P<spoiler>\|\|[^\n]+?\|\|)"
+    r"|(?P<link>\[[^\]\n]+\]\([^)\n]+\))"
+)
+
+
+def _process_inline(text: str) -> str:
+    """Convert inline CommonMark to MarkdownV2 and escape the rest."""
+    out, pos = [], 0
+    for m in _INLINE_RE.finditer(text):
+        if m.start() > pos:
+            out.append(_esc_mdv2(text[pos:m.start()]))
+        kind = m.lastgroup
+        s = m.group(0)
+        if kind == "code":
+            # MarkdownV2 inline code: backticks delimit; content is literal.
+            out.append(s)
+        elif kind == "math":
+            # No native math in MarkdownV2 — render as inline code.
+            out.append("`" + s[1:-1] + "`")
+        elif kind == "bold":
+            out.append("*" + _esc_mdv2(s[2:-2]) + "*")
+        elif kind == "italic":
+            out.append("_" + _esc_mdv2(s[1:-1]) + "_")
+        elif kind == "strike":
+            out.append("~" + _esc_mdv2(s[2:-2]) + "~")
+        elif kind == "spoiler":
+            out.append("||" + _esc_mdv2(s[2:-2]) + "||")
+        elif kind == "link":
+            lm = _re.match(r"\[([^\]]+)\]\(([^)]+)\)", s)
+            if lm:
+                out.append("[" + _esc_mdv2(lm.group(1)) + "](" + _esc_mdv2_url(lm.group(2)) + ")")
+            else:
+                out.append(_esc_mdv2(s))
+        pos = m.end()
+    if pos < len(text):
+        out.append(_esc_mdv2(text[pos:]))
+    return "".join(out)
+
+
+def _render_table_block(rows: list) -> list:
+    """Render a CommonMark pipe-table as a monospace pre-block."""
+    parsed = []
+    for row in rows:
+        stripped = row.strip()
+        if stripped.startswith("|"):
+            stripped = stripped[1:]
+        if stripped.endswith("|"):
+            stripped = stripped[:-1]
+        parsed.append([c.strip() for c in stripped.split("|")])
+    body = [r for r in parsed if not all(_re.match(r"^:?-+:?$", c or "") for c in r)]
+    if not body:
+        return []
+    ncols = max(len(r) for r in body)
+    widths = [0] * ncols
+    for r in body:
+        for j in range(ncols):
+            cell = r[j] if j < len(r) else ""
+            widths[j] = max(widths[j], len(cell))
+    out = ["```"]
+    for idx, r in enumerate(body):
+        padded = [(r[j] if j < len(r) else "").ljust(widths[j]) for j in range(ncols)]
+        out.append("│ " + " │ ".join(padded) + " │")
+        if idx == 0:
+            out.append("├─" + "─┼─".join("─" * w for w in widths) + "─┤")
+    out.append("```")
+    return out
+
+
+_HEADING_RE = _re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+_HR_RE = _re.compile(r"^[-*_=]{3,}\s*$")
+_TASK_RE = _re.compile(r"^(\s*)-\s+\[([ xX])\]\s+(.*)$")
+_BQ_RE = _re.compile(r"^(\s*)>\s?(.*)$")
+_TABLE_LINE_RE = _re.compile(r"^\s*\|.*\|\s*$")
+_FENCE_RE = _re.compile(r"^(\s*)```\s*(\S*)\s*$")
+
+
+def _md_to_mdv2(md: str) -> str:
+    """Convert our CommonMark output to MarkdownV2-safe text.
+
+    Headings → bold, tables → monospace pre-blocks, math → code, task lists →
+    ✅/⬜, HR → ─── divider, code fences preserved verbatim, all other special
+    chars escaped per MarkdownV2 rules.
+    """
+    out = []
+    lines = md.split("\n")
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        rstrip = line.rstrip()
+
+        # Fenced code block — preserve content verbatim.
+        m = _FENCE_RE.match(rstrip)
+        if m:
+            indent, lang = m.groups()
+            out.append(f"{indent}```{lang}" if lang else f"{indent}```")
+            i += 1
+            while i < n and not _FENCE_RE.match(lines[i].rstrip()):
+                out.append(lines[i])
+                i += 1
+            if i < n:
+                out.append("```")
+                i += 1
+            continue
+
+        # Display math.
+        if rstrip == "$$":
+            out.append("```")
+            i += 1
+            while i < n and lines[i].rstrip() != "$$":
+                out.append(lines[i])
+                i += 1
+            out.append("```")
+            i += 1
+            continue
+        if rstrip.startswith("$$") and rstrip.endswith("$$") and len(rstrip) > 4:
+            out.append("```")
+            out.append(rstrip[2:-2].strip())
+            out.append("```")
+            i += 1
+            continue
+
+        # Pipe table.
+        if _TABLE_LINE_RE.match(line):
+            tbl = []
+            while i < n and _TABLE_LINE_RE.match(lines[i]):
+                tbl.append(lines[i])
+                i += 1
+            out.extend(_render_table_block(tbl))
+            continue
+
+        # Heading → bold (no nested inline processing — keep it simple).
+        h = _HEADING_RE.match(line)
+        if h:
+            inner = h.group(2).replace("**", "").replace("__", "")
+            out.append("*" + _esc_mdv2(inner) + "*")
+            i += 1
+            continue
+
+        # Horizontal rule.
+        if _HR_RE.match(line):
+            out.append(_esc_mdv2("───────────────"))
+            i += 1
+            continue
+
+        # Task list.
+        tl = _TASK_RE.match(line)
+        if tl:
+            indent, mark, content = tl.groups()
+            box = "✅" if mark.lower() == "x" else "⬜"
+            out.append(f"{indent}{box} {_process_inline(content)}")
+            i += 1
+            continue
+
+        # Blockquote.
+        bq = _BQ_RE.match(line)
+        if bq:
+            indent, content = bq.groups()
+            out.append(f"{indent}>{_process_inline(content)}")
+            i += 1
+            continue
+
+        out.append(_process_inline(line))
+        i += 1
+
+    return "\n".join(out)
+
+
+def _send_one(chat_id, thread_id, original_text, with_stop_button=False):
+    """Send a single chunk via sendMessage. Tries MarkdownV2 (converted) first,
+    falls back to plain text on parse errors. Returns the message_id or None."""
+    converted = _md_to_mdv2(original_text)[:TG_MAX_LEN]
+    payload = {"chat_id": chat_id, "text": converted, "parse_mode": "MarkdownV2"}
     if thread_id:
         payload["message_thread_id"] = thread_id
     if with_stop_button:
         payload["reply_markup"] = _stop_keyboard()
     try:
-        resp = api_json("sendRichMessage", payload)
+        resp = api_json("sendMessage", payload)
         return resp.get("result", {}).get("message_id")
     except urllib.error.HTTPError as e:
-        log(f"[sendRichMessage failed ({e.code}), falling back to legacy Markdown]")
-        return _send_legacy(chat_id, thread_id, text, with_stop_button)
-
-
-def _send_legacy(chat_id, thread_id, text, with_stop_button=False):
-    """Fallback: classic sendMessage with Markdown parse_mode, chunked at 4096."""
-    chunks = [text[i:i + LEGACY_CHUNK] for i in range(0, len(text), LEGACY_CHUNK)] or [""]
-    last_id = None
-    for idx, chunk in enumerate(chunks):
-        payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"}
-        if thread_id:
-            payload["message_thread_id"] = thread_id
-        # Only attach the stop button to the LAST chunk
-        if with_stop_button and idx == len(chunks) - 1:
-            payload["reply_markup"] = _stop_keyboard()
-        try:
-            resp = api_json("sendMessage", payload)
-        except urllib.error.HTTPError:
-            payload.pop("parse_mode", None)
-            try:
-                resp = api_json("sendMessage", payload)
-            except urllib.error.HTTPError:
-                resp = {}
-        last_id = resp.get("result", {}).get("message_id") or last_id
-    return last_id
+        log(f"[MarkdownV2 send failed ({e.code}), retrying as plain text]")
+    payload["text"] = original_text[:TG_MAX_LEN]
+    payload.pop("parse_mode", None)
+    try:
+        resp = api_json("sendMessage", payload)
+        return resp.get("result", {}).get("message_id")
+    except urllib.error.HTTPError:
+        return None
 
 
 def send_message(key, text):
-    """Send a final reply. Chunks if needed."""
+    """Send a final reply, chunking on the original text if it's over the limit
+    so formatting blocks tend to stay intact within a single chunk."""
     chat_id, thread_id = _parse_key(key)
-    if len(text) <= RICH_CHUNK:
-        _send_rich(chat_id, thread_id, text)
+    if len(text) <= TG_MAX_LEN:
+        _send_one(chat_id, thread_id, text, False)
         return
-    for i in range(0, len(text), RICH_CHUNK):
-        _send_rich(chat_id, thread_id, text[i:i + RICH_CHUNK])
+    for i in range(0, len(text), TG_MAX_LEN):
+        _send_one(chat_id, thread_id, text[i:i + TG_MAX_LEN])
 
 
 def send_message_with_id(key, text, with_stop_button=False):
     """Send a message and return its id (for later edit_message updates)."""
     chat_id, thread_id = _parse_key(key)
-    return _send_rich(chat_id, thread_id, text[:RICH_CHUNK], with_stop_button)
+    return _send_one(chat_id, thread_id, text, with_stop_button)
 
 
 def edit_message(key, message_id, text, with_stop_button=False):
     if not message_id:
         return
     chat_id, _ = _parse_key(key)
-    text = text[:RICH_CHUNK]
-    payload = {"chat_id": chat_id, "message_id": message_id,
-               "rich_message": {"markdown": text}}
+    converted = _md_to_mdv2(text)[:TG_MAX_LEN]
+    payload = {
+        "chat_id": chat_id, "message_id": message_id,
+        "text": converted, "parse_mode": "MarkdownV2",
+    }
     if with_stop_button:
         payload["reply_markup"] = _stop_keyboard()
     else:
@@ -524,21 +708,12 @@ def edit_message(key, message_id, text, with_stop_button=False):
         return
     except urllib.error.HTTPError:
         pass
-    # Fallback to legacy edit
-    payload = {"chat_id": chat_id, "message_id": message_id,
-               "text": text[:LEGACY_CHUNK], "parse_mode": "Markdown"}
-    if with_stop_button:
-        payload["reply_markup"] = _stop_keyboard()
-    else:
-        payload["reply_markup"] = {"inline_keyboard": []}
+    payload["text"] = text[:TG_MAX_LEN]
+    payload.pop("parse_mode", None)
     try:
         api_json("editMessageText", payload)
     except urllib.error.HTTPError:
-        payload.pop("parse_mode", None)
-        try:
-            api_json("editMessageText", payload)
-        except urllib.error.HTTPError:
-            pass
+        pass
 
 
 # ---------------------------------------------------------------------------
