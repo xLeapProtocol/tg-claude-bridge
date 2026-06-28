@@ -1315,16 +1315,15 @@ def poll_loop():
             # (case-insensitive). The tag is stripped before processing and
             # the prior chat history is prepended as context for the agent.
             history_prefix = ""
-            if MENTION_TAG and not fwd:
+            if MENTION_TAG:
                 stripped = text.lstrip()
                 if not stripped.lower().startswith(MENTION_TAG.lower()):
                     log(f"  [update {uid}] missing mention tag, ignored")
                     continue
+            if not fwd:
                 text = stripped[len(MENTION_TAG):].lstrip()
                 history_prefix = format_history_block(hist_key, exclude_last=True)
-            elif MENTION_TAG and fwd:
-                # Forwarded messages are an explicit hand-off — bypass the gate
-                # but still include surrounding chat history as context.
+            else:
                 history_prefix = format_history_block(hist_key, exclude_last=True)
 
             # Ignore messages from the "General" topic (no thread ID)
