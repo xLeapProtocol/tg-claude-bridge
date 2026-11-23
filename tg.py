@@ -14,6 +14,8 @@ Environment variables:
 
 import json
 import os
+import pwd
+import re
 import subprocess
 from collections import deque
 from datetime import datetime
@@ -649,6 +651,65 @@ def _format_usage(u: dict, title: str) -> str:
 CREDENTIALS_FILE = os.path.expanduser("~/.claude/.credentials.json")
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
+# r0 only: when r0's Claude login is dead, borrow mich's credentials instead of
+# requiring a manual `/login`. Checked per message (expiry before the call,
+# auth error after it). r0 has passwordless sudo to read mich's file.
+FALLBACK_CREDS_USER = "r0"
+FALLBACK_CREDS_SRC = "/home/mich/.claude/.credentials.json"
+AUTH_ERROR_RE = re.compile(
+    r"/login|authentication_error|failed to authenticate|could not be refreshed|"
+    r"invalid api key|oauth (token|session).*(expired|revoked)|\b401\b",
+    re.IGNORECASE)
+
+
+KEEPALIVE_INTERVAL = 24 * 3600
+
+
+def credentials_keepalive_loop():
+    """Once a day, run a trivial `claude -p` so Claude Code refreshes the
+    short-lived access token (falls back to mich's creds if r0's are dead)."""
+    while True:
+        time.sleep(KEEPALIVE_INTERVAL)
+        if _creds_expired():
+            copy_fallback_credentials()
+        try:
+            r = subprocess.run(["claude", "-p", "--max-turns", "1", "reply ok"],
+                               capture_output=True, text=True, timeout=300, cwd=WORK_DIR)
+            out = (r.stdout + r.stderr).strip()
+            if r.returncode != 0 and AUTH_ERROR_RE.search(out) and copy_fallback_credentials():
+                subprocess.run(["claude", "-p", "--max-turns", "1", "reply ok"],
+                               capture_output=True, text=True, timeout=300, cwd=WORK_DIR)
+            log(f"credentials keepalive: rc={r.returncode} {out[:80]!r}")
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"credentials keepalive failed: {e}")
+
+
+def _creds_fallback_enabled() -> bool:
+    return pwd.getpwuid(os.getuid()).pw_name == FALLBACK_CREDS_USER
+
+
+def _creds_expired() -> bool:
+    """True if r0's refresh token is past expiry or the file is unusable."""
+    try:
+        with open(CREDENTIALS_FILE) as f:
+            exp = json.load(f)["claudeAiOauth"]["refreshTokenExpiresAt"]
+    except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError):
+        return True
+    return exp / 1000 <= time.time()
+
+
+def copy_fallback_credentials() -> bool:
+    """Replace r0's credentials with mich's. Returns True on success."""
+    r = subprocess.run(
+        ["sudo", "-n", "install", "-m", "600", "-o", FALLBACK_CREDS_USER,
+         "-g", FALLBACK_CREDS_USER, FALLBACK_CREDS_SRC, CREDENTIALS_FILE],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        log(f"credentials fallback copy failed: {r.stderr.strip()}")
+        return False
+    log(f"credentials: copied {FALLBACK_CREDS_SRC} -> {CREDENTIALS_FILE}")
+    return True
+
 
 def _fmt_reset(iso: str) -> str:
     try:
@@ -802,7 +863,24 @@ def tmux_relay(target, message, key, thinking_msg_id, stop_event):
 
 def call_claude_streaming(chat_id, message, conversation_id=None,
                           thinking_msg_id=None, stop_event=None, work_dir=None):
-    """Run claude CLI in streaming mode. Returns (response_text, conversation_id)."""
+    """Run claude CLI in streaming mode. Returns (response_text, conversation_id).
+
+    For r0, swaps in mich's credentials when r0's login is expired or the
+    call fails with an auth error, retrying once in the latter case."""
+    args = (chat_id, message, conversation_id, thinking_msg_id, stop_event, work_dir)
+    if not _creds_fallback_enabled():
+        return _call_claude_streaming_once(*args)[:2]
+    if _creds_expired():
+        copy_fallback_credentials()
+    response, conv_id, is_error = _call_claude_streaming_once(*args)
+    if is_error and AUTH_ERROR_RE.search(response or "") and copy_fallback_credentials():
+        response, conv_id, is_error = _call_claude_streaming_once(*args)
+    return response, conv_id
+
+
+def _call_claude_streaming_once(chat_id, message, conversation_id=None,
+                                thinking_msg_id=None, stop_event=None, work_dir=None):
+    """Returns (response_text, conversation_id, is_error)."""
     cwd = work_dir or WORK_DIR
     env = os.environ.copy()
     env["IS_SANDBOX"] = "1"
@@ -822,12 +900,13 @@ def call_claude_streaming(chat_id, message, conversation_id=None,
             text=True, cwd=cwd, env=env,
         )
     except FileNotFoundError:
-        return "[error: claude CLI not found in PATH]", conversation_id
+        return "[error: claude CLI not found in PATH]", conversation_id, True
 
     thinking_text = ""
     tool_lines = []
     response_text = ""
     conv_id = conversation_id
+    result_is_error = False
     last_update = 0
     current_block_type = None
     current_tool_name = ""
@@ -947,6 +1026,7 @@ def call_claude_streaming(chat_id, message, conversation_id=None,
 
             elif etype == "result":
                 conv_id = event.get("session_id", conv_id)
+                result_is_error = bool(event.get("is_error"))
                 add_usage(chat_id, event.get("total_cost_usd", 0.0),
                           event.get("usage", {}) or {})
                 if not response_text:
@@ -956,18 +1036,19 @@ def call_claude_streaming(chat_id, message, conversation_id=None,
         update_thinking_msg(final=True)
 
         if stop_event.is_set():
-            return "\U0001f6d1 *Stopped by user.*", conv_id
+            return "\U0001f6d1 *Stopped by user.*", conv_id, False
 
         if proc.returncode != 0:
             stderr = proc.stderr.read()
             if stderr and not response_text:
-                return stderr.strip(), conv_id
+                return stderr.strip(), conv_id, True
 
-        return response_text.strip() if response_text else "[empty response]", conv_id
+        text = response_text.strip() if response_text else "[empty response]"
+        return text, conv_id, result_is_error or proc.returncode != 0
 
     except Exception as e:
         proc.kill()
-        return f"[error: {e}]", conv_id
+        return f"[error: {e}]", conv_id, True
 
 
 # ---------------------------------------------------------------------------
@@ -1378,6 +1459,9 @@ def main():
         log(f"[tg-claude bridge started, allowed chats: {ALLOWED_CHATS}]")
     else:
         log("[tg-claude bridge started, accepting ALL chats]")
+
+    if _creds_fallback_enabled():
+        threading.Thread(target=credentials_keepalive_loop, daemon=True).start()
 
     poll_loop()
 
