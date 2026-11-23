@@ -10,6 +10,11 @@ Environment variables:
     TG_BOT_TOKEN  — bot token from @BotFather
     TG_ALLOWED_CHATS — (optional) comma-separated list of allowed chat IDs.
                         If empty, all chats are accepted.
+    TG_QUOTA_WATCH — (optional) "0" turns off the usage-window warnings.
+    TG_QUOTA_TURN_NOTE — (optional) % of the 5h window an answer must take
+                        to get a one-line bill after it (default 3).
+    TG_QUOTA_TURN_WARN — (optional) % of the 5h window a running turn takes
+                        between warnings (default 5).
 """
 
 import json
@@ -728,8 +733,9 @@ def _window_row(label: str, w: dict | None) -> str | None:
     return f"| {label:<9} | {left:>3.0f}% | {used:>3.0f}% | {resets:<9} |"
 
 
-def fetch_remaining_quota() -> tuple[str | None, str | None]:
-    """Best-effort fetch of subscription limit windows. Returns (markdown_table, error)."""
+def _fetch_usage(timeout: float = 20) -> tuple[dict | None, str | None]:
+    """Ask Anthropic how much of each subscription window is used.
+    Returns (response, error)."""
     try:
         with open(CREDENTIALS_FILE) as f:
             token = json.load(f)["claudeAiOauth"]["accessToken"]
@@ -742,14 +748,21 @@ def fetch_remaining_quota() -> tuple[str | None, str | None]:
         "anthropic-version": "2023-06-01",
     })
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read())
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read()), None
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             return None, "token expired — run any claude command to refresh"
         return None, f"HTTP {e.code}"
     except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
         return None, f"request failed: {e}"
+
+
+def fetch_remaining_quota() -> tuple[str | None, str | None]:
+    """Best-effort fetch of subscription limit windows. Returns (markdown_table, error)."""
+    data, err = _fetch_usage()
+    if data is None:
+        return None, err
 
     windows = (
         ("5h", "five_hour"),
@@ -764,6 +777,197 @@ def fetch_remaining_quota() -> tuple[str | None, str | None]:
     header = ("| Window    | Left | Used | Resets    |\n"
               "|:----------|-----:|-----:|:----------|")
     return header + "\n" + "\n".join(rows), None
+
+
+# ---------------------------------------------------------------------------
+# Quota watch — say when the subscription window is going fast
+# ---------------------------------------------------------------------------
+# The limit is hit without warning otherwise: one heavy task (parallel agents,
+# a long research run) can eat a fifth of the five-hour window on its own.
+# Each Claude turn is followed here: a warning with Continue/Stop buttons
+# while it runs, and a one-line bill after it. Percentages come from the same
+# endpoint as /usage; they count everything on the account, so another bot
+# working on the same login at that moment shows up in the numbers too.
+
+QUOTA_WATCH = os.environ.get(
+    "TG_QUOTA_WATCH", "1").strip().lower() not in ("0", "false", "no", "off")
+# An answer that took at least this much of the five-hour window gets a bill.
+QUOTA_TURN_NOTE = float(os.environ.get("TG_QUOTA_TURN_NOTE", "3"))
+# A running turn warns every time it has taken this much more of the window.
+QUOTA_TURN_WARN = float(os.environ.get("TG_QUOTA_TURN_WARN", "5"))
+QUOTA_POLL = 90            # seconds between looks while a turn runs
+QUOTA_MARKS = (50, 75, 90)  # used-% marks worth a line when a turn crosses one
+QUOTA_PACE_WINDOW = 1800   # the pace is judged over the last half hour
+
+_quota_lock = threading.Lock()
+_quota_last: dict | None = None
+_quota_samples: deque = deque(maxlen=200)
+
+
+def _reset_ts(w: dict) -> float | None:
+    try:
+        return datetime.fromisoformat(w["resets_at"]).timestamp()
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def quota_snapshot(max_age: float = 20) -> dict | None:
+    """Where the windows stand now: {"t", "used", "resets", "week_used"}, with
+    `used` in percent of the five-hour window. None when it cannot be told.
+    Shared between chats, so several running turns cost one request."""
+    global _quota_last
+    with _quota_lock:
+        if _quota_last and time.time() - _quota_last["t"] < max_age:
+            return _quota_last
+        data, _err = _fetch_usage(timeout=8)
+        five = (data or {}).get("five_hour") or {}
+        if five.get("utilization") is None:
+            return None
+        week = data.get("seven_day") or {}
+        _quota_last = {"t": time.time(), "used": float(five["utilization"]),
+                       "resets": _reset_ts(five),
+                       "week_used": week.get("utilization")}
+        _quota_samples.append(_quota_last)
+        return _quota_last
+
+
+def _same_window(a: dict, b: dict) -> bool:
+    if a["resets"] is None or b["resets"] is None:
+        return b["used"] >= a["used"]
+    return abs(a["resets"] - b["resets"]) < 120
+
+
+def quota_spent(start: dict, now: dict) -> float:
+    """Percent of the window used between two snapshots. A window that reset
+    in between is counted from zero."""
+    return now["used"] - start["used"] if _same_window(start, now) else now["used"]
+
+
+def quota_eta(now: dict, since: dict | None = None) -> float | None:
+    """Seconds until the window runs out at the current pace, if that comes
+    before it resets; None otherwise. The pace is taken from `since`, or from
+    the oldest look at this window within the last half hour."""
+    if since is None:
+        since = next((s for s in list(_quota_samples)
+                      if now["t"] - s["t"] <= QUOTA_PACE_WINDOW
+                      and _same_window(s, now)), None)
+    if not since or not _same_window(since, now):
+        return None
+    span, spent = now["t"] - since["t"], now["used"] - since["used"]
+    # Percentages come whole: two points over three minutes is the least
+    # that says anything about a pace.
+    if span < 180 or spent < 2:
+        return None
+    eta = (100 - now["used"]) * span / spent
+    if now["resets"] is not None and eta >= now["resets"] - now["t"]:
+        return None
+    return eta
+
+
+def _fmt_span(seconds: float) -> str:
+    minutes = max(1, round(seconds / 60))
+    if minutes < 60:
+        return f"{minutes} мин"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ч {minutes} мин" if minutes else f"{hours} ч"
+
+
+def _quota_left(now: dict) -> str:
+    text = f"Осталось {max(0, 100 - now['used']):.0f}%"
+    if now["resets"] is not None:
+        text += f", сброс через {_fmt_span(now['resets'] - now['t'])}"
+    return text + "."
+
+
+def _quota_keyboard() -> dict:
+    return {"inline_keyboard": [[
+        {"text": "▶️ Продолжать", "callback_data": "q:go"},
+        {"text": "\U0001f6d1 Остановить", "callback_data": "force_stop"},
+    ]]}
+
+
+class QuotaWatch:
+    """Follows the five-hour window for the length of one Claude turn."""
+
+    def __init__(self, key: str):
+        self.key = key
+        self.start = None
+        self.next_warn = QUOTA_TURN_WARN
+        self.warned_pace = self.warned_low = False
+        self._done = threading.Event()
+        if QUOTA_WATCH:
+            threading.Thread(target=self._run, daemon=True,
+                             name=f"quota-{key}").start()
+
+    def _run(self):
+        self.start = quota_snapshot()
+        while not self._done.wait(QUOTA_POLL):
+            try:
+                self._check()
+            except Exception as e:
+                log(f"[{self.key}] quota watch: {e}", self.key)
+
+    def _check(self):
+        now = quota_snapshot()
+        if not now:
+            return
+        if not self.start:
+            self.start = now
+            return
+        spent = quota_spent(self.start, now)
+        eta = quota_eta(now, self.start)
+        low = now["used"] >= QUOTA_MARKS[-1]
+        why = None
+        if spent >= self.next_warn:
+            why = "spent"
+        elif eta is not None and eta < 1800 and not self.warned_pace:
+            why = "pace"
+        elif low and not self.warned_low:
+            why = "low"
+        if not why:
+            return
+        while self.next_warn <= spent:
+            self.next_warn += QUOTA_TURN_WARN
+        self.warned_pace = self.warned_pace or eta is not None
+        self.warned_low = self.warned_low or low
+        text = (f"⚠️ Эта задача уже заняла {spent:.0f}% пятичасового "
+                f"окна за {_fmt_span(now['t'] - self.start['t'])}. "
+                + _quota_left(now))
+        if eta is not None:
+            text += (f" При таком темпе лимит кончится через {_fmt_span(eta)}"
+                     " — раньше сброса.")
+        log(f"[{self.key}] quota warning ({why}): {text}", self.key)
+        chat_id, thread_id = _parse_key(self.key)
+        payload = {"chat_id": chat_id, "text": text,
+                   "reply_markup": _quota_keyboard()}
+        if thread_id:
+            payload["message_thread_id"] = thread_id
+        api_json("sendMessage", payload)
+
+    def finish(self) -> str | None:
+        """Stop watching. Returns the bill for the turn if it is worth a line:
+        a costly answer, or one that took the window past a mark."""
+        self._done.set()
+        if not QUOTA_WATCH or not self.start:
+            return None
+        now = quota_snapshot(max_age=0)
+        if not now:
+            return None
+        spent = quota_spent(self.start, now)
+        before = now["used"] - spent
+        crossed = any(before < m <= now["used"] for m in QUOTA_MARKS)
+        if spent < QUOTA_TURN_NOTE and not crossed:
+            return None
+        text = (f"\U0001f4ca Этот ответ занял {spent:.0f}% пятичасового окна. "
+                + _quota_left(now))
+        eta = quota_eta(now)
+        if eta is not None:
+            text += (f" ⚠️ При таком темпе лимит кончится через "
+                     f"{_fmt_span(eta)} — раньше сброса.")
+        week = now.get("week_used")
+        if week is not None and week >= 75:
+            text += f" Недельное окно: осталось {max(0, 100 - week):.0f}%."
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -1258,6 +1462,7 @@ class ChatWorker:
             thinking_msg_id = send_message_with_id(
                 self.chat_id, "\U0001f4ad *Thinking...*", with_stop_button=True)
 
+            quota = QuotaWatch(self.chat_id)
             response, conversation_id = call_claude_streaming(
                 self.chat_id, combined, conversation_id, thinking_msg_id,
                 self.stop_event, self.work_dir,
@@ -1265,6 +1470,18 @@ class ChatWorker:
             set_conversation_id(self.chat_id, conversation_id)
             log(f"[{self.chat_id}] conv={conversation_id} resp: {response[:80]}...", self.chat_id)
             send_message(self.chat_id, response)
+            try:
+                bill = quota.finish()
+                if bill:
+                    log(f"[{self.chat_id}] {bill}", self.chat_id)
+                    bill_chat, bill_thread = _parse_key(self.chat_id)
+                    payload = {"chat_id": bill_chat, "text": bill,
+                               "disable_notification": True}
+                    if bill_thread:
+                        payload["message_thread_id"] = bill_thread
+                    api_json("sendMessage", payload)
+            except Exception as e:
+                log(f"[{self.chat_id}] quota bill failed: {e}", self.chat_id)
 
             # Process any /steer messages that arrived during processing
             while not self.steer_queue.empty():
@@ -1322,6 +1539,20 @@ def poll_loop():
 
             # --- Callback queries (stop button) ---
             cb = update.get("callback_query")
+            if cb and cb.get("data") == "q:go":
+                # "Continue" under a quota warning: nothing to do but take
+                # the buttons away, the turn never stopped.
+                cb_msg = cb.get("message", {})
+                try:
+                    api("answerCallbackQuery",
+                        callback_query_id=cb["id"], text="Продолжаю")
+                    api_json("editMessageReplyMarkup", {
+                        "chat_id": cb_msg.get("chat", {}).get("id"),
+                        "message_id": cb_msg.get("message_id"),
+                        "reply_markup": {"inline_keyboard": []}})
+                except Exception:
+                    pass
+                continue
             if cb and cb.get("data") == "force_stop":
                 cb_msg = cb.get("message", {})
                 cb_chat_id = str(cb_msg.get("chat", {}).get("id", ""))
