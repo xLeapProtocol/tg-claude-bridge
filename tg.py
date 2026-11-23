@@ -1632,10 +1632,7 @@ def poll_loop():
                 if not stripped.lower().startswith(MENTION_TAG.lower()):
                     log(f"  [update {uid}] missing mention tag, ignored")
                     continue
-            if not fwd:
                 text = stripped[len(MENTION_TAG):].lstrip()
-                history_prefix = format_history_block(hist_key, exclude_last=True)
-            else:
                 history_prefix = format_history_block(hist_key, exclude_last=True)
 
             # Ignore messages from the "General" topic (no thread ID)
